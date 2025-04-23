@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Literal, Tuple, List, Dict, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +29,7 @@ import numpy as np
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
 # Package‑local imports ------------------------------------------------------
-from .constants import kRadiusC, kRadiusCA, kRadiusN, kRadiusO, kRadiusWater
+from .constants import kRadiusC, kRadiusCA, kRadiusN, kRadiusO, kRadiusWater, element_radii, kRadiusDefault
 from .types import ChainPytree  # type: ignore – project‑specific
 
 # ---------------------------------------------------------------------------
@@ -202,12 +202,24 @@ _BackendName = Literal["auto", "vmap2", "nlist", "loop"]
 
 def _select_backend(n_atoms: int, request: _BackendName) -> str:
     if request != "auto":
+        log.info(f"Backend '{request}' explicitly requested.")
         return request
+
+    # Default to 'nlist' if 'auto' is requested
+    # The vmap2 backend uses O(N^2) memory and is often too demanding.
+    log.debug("Backend set to 'auto', defaulting to 'nlist'.")
+    # Keep the atom count checks mainly for logging/info
     if n_atoms <= 6_000:
-        return "vmap2"
-    if n_atoms <= 150_000:
-        return "nlist"
-    return "loop"
+        log.debug("    (Atom count %d <= 6000, 'vmap2' could be used if requested explicitly)", n_atoms)
+    elif n_atoms > 150_000:
+        log.warning("    (Atom count %d > 150000, 'nlist' backend might become slow)", n_atoms)
+
+    # Currently, the 'loop' backend is not fully supported with ligands, so we default to nlist.
+    # if n_atoms > 150_000:
+    #     log.warning("Atom count > 150000, falling back to 'loop'.")
+    #     return "loop"
+
+    return "nlist" # Default to nlist when request is 'auto'
 
 
 # ---------------------------------------------------------------------------
@@ -217,86 +229,158 @@ def _select_backend(n_atoms: int, request: _BackendName) -> str:
 def calculate_accessibility(
     chain: ChainPytree,
     *,
+    ligand_atoms: Optional[List[Dict[str, Any]]] = None,
     n_dots: int = 960,
     backend: _BackendName = "auto",
 ):
-    """Return a *new* ChainPytree with per‑residue ``accessibility`` field."""
+    """Calculates accessibility for protein residues, considering the environment.
 
+    Includes protein atoms and optionally specified ligand atoms in the
+    calculation environment that can occlude protein atoms.
+
+    Args:
+        chain: The input ChainPytree representing the protein.
+        ligand_atoms: Optional flat list of dictionaries for target ligand atoms
+                      (from load_cif_data), each containing 'coords', 'symbol', 'ligand_key'.
+        n_dots: Number of points for surface dot generation.
+        backend: SASA calculation backend to use ("auto", "vmap2", "nlist", "loop").
+
+    Returns:
+        A *new* ChainPytree with per‑residue ``accessibility`` field calculated
+        considering occlusion by protein and specified ligand atoms.
+    """
+
+    # Handle empty input
+    if not chain and not ligand_atoms:
+        log.warning("Cannot calculate accessibility: No protein chain or ligand atoms provided.")
+        return chain # Return empty chain if protein chain was empty
     if not chain:
-        return chain
+        log.warning("Protein chain is empty, calculating SASA only for ligands is not yet supported by the return type.")
+        # Cannot currently return ligand SASA, return empty chain
+        return []
 
     # 1. Extract atom arrays ------------------------------------------------
     bb_radii = {"N": kRadiusN, "CA": kRadiusCA, "C": kRadiusC, "O": kRadiusO}
     bb_order = ("N", "CA", "C", "O")
 
-    coords_buf, radii_buf, atom2res = [], [], []
+    coords_buf, radii_buf, atom_to_entity_idx = [], [], []
+    protein_atom_count = 0
+
+    # Process protein atoms
     for res_idx, res in enumerate(chain):
         bb = res["bb_coords"]
+        start_protein_atom_idx = len(coords_buf) # Index before adding this residue's atoms
+        num_atoms_this_res = 0
         for name in bb_order:
             xyz = getattr(bb, name)
             if not jnp.any(jnp.isnan(xyz)):
                 coords_buf.append(xyz)
                 radii_buf.append(bb_radii[name])
-                atom2res.append(res_idx)
+                num_atoms_this_res += 1
         sc_xyz = res["sidechain_coords"]
         sc_rad = res["sidechain_radii"]
         if sc_xyz.size:
-            # Use extend with list comprehension for coordinates
             coords_buf.extend([row for row in sc_xyz])
-            # Use extend with list() for radii array
             radii_buf.extend(list(sc_rad))
-            atom2res.extend([res_idx] * sc_xyz.shape[0])
+            num_atoms_this_res += sc_xyz.shape[0]
 
-    if not coords_buf: # Check if buffer is empty after processing all residues
-        log.warning("No valid atoms found to calculate accessibility.")
-        # Return chain with NaN accessibility or handle as appropriate
+        # Assign residue index to all atoms added for this residue
+        atom_to_entity_idx.extend([res_idx] * num_atoms_this_res)
+        protein_atom_count += num_atoms_this_res
+
+    # Process ligand atoms if provided
+    ligand_atom_count = 0
+    ligand_key_map = {}
+    ligand_start_idx = len(chain) # Assign indices starting after protein residues
+
+    if ligand_atoms:
+        for atom_dict in ligand_atoms:
+            ligand_key = atom_dict['ligand_key']
+            symbol = atom_dict['symbol'].upper()
+            coords = atom_dict['coords'] # Should be numpy array from io.py
+
+            # Assign a unique index to this ligand molecule if not seen before
+            if ligand_key not in ligand_key_map:
+                ligand_key_map[ligand_key] = ligand_start_idx
+                ligand_start_idx += 1
+            entity_idx = ligand_key_map[ligand_key]
+
+            # Get radius (handle missing elements with default)
+            radius = element_radii.get(symbol, kRadiusDefault)
+            if symbol not in element_radii:
+                log.warning(f"Using default radius {kRadiusDefault}Å for unknown ligand element: '{symbol}' in {ligand_key}")
+
+            coords_buf.append(jnp.asarray(coords)) # Ensure JAX array
+            radii_buf.append(radius)
+            atom_to_entity_idx.append(entity_idx)
+            ligand_atom_count += 1
+
+    if protein_atom_count + ligand_atom_count == 0:
+        log.warning("No valid atoms found after processing protein and ligands.")
         return [{**res, "accessibility": float('nan')} for res in chain]
 
+    # Stack all coordinates and radii (protein + ligand)
     all_coords = jnp.stack(coords_buf)
     all_radii = jnp.asarray(radii_buf, dtype=jnp.float32)
-    atom2res = jnp.asarray(atom2res, dtype=jnp.int32)
+    atom_to_entity_idx_arr = jnp.asarray(atom_to_entity_idx, dtype=jnp.int32)
+    num_total_atoms = all_coords.shape[0]
+    num_entities = ligand_start_idx # Total number of protein residues + unique ligands
 
-    n_atoms = all_coords.shape[0]
-    selected_backend = _select_backend(n_atoms, backend)
-    log.info("[cyan]SASA:[/] Using backend '%s' for %d atoms", selected_backend, n_atoms)
+    log.info(f"--> Prepared {protein_atom_count} protein atoms and {ligand_atom_count} ligand atoms for SASA environment.")
+
+    # Select backend based on TOTAL number of atoms
+    selected_backend = _select_backend(num_total_atoms, backend)
+    log.info("[cyan]SASA:[/] Using backend '%s' for %d total atoms (%d entities)", selected_backend, num_total_atoms, num_entities)
 
     # 2. Surface dots -------------------------------------------------------
     surface_dots, dot_w = generate_surface_dots(n_dots)
 
+    # 3. Run SASA calculation on ALL atoms ----------------------------------
+    atom_sasa = jnp.zeros(num_total_atoms, dtype=jnp.float32) # Initialize
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as bar:
-        task = bar.add_task("Running SASA kernel", total=None)
+        task = bar.add_task("Running SASA kernel on all atoms", total=None)
         if selected_backend == "vmap2":
             atom_sasa = _sasa_vmap2(all_coords, all_radii, surface_dots, dot_w)
         elif selected_backend == "nlist":
             atom_sasa = _sasa_nlist(all_coords, all_radii, surface_dots, dot_w)
         else:  # 'loop'
-            # Import the original (non-optimized) accessibility calculation dynamically
-            # This assumes the original is in a module named 'accessibility_original.py'
-            # or similar, or handled differently if it's the same file.
-            # For now, let's assume a placeholder import mechanism.
-            try:
-                # Attempt to import the original implementation if needed
-                from .accessibility_original import calculate_accessibility as _slow
-                log.warning("Falling back to original 'loop' implementation.")
-                return _slow(chain, n_dots=n_dots)
-            except ImportError:
-                log.error("Original 'loop' backend implementation not found. Cannot proceed.")
-                # Return chain with NaNs or raise error
+            # Loop backend would need significant modification to handle mixed protein/ligand
+            # For simplicity, we'll raise an error or return NaN if loop is selected with ligands.
+            if ligand_atoms:
+                log.error("'loop' backend is not supported when ligands are included. Use 'vmap2' or 'nlist'.")
                 return [{**res, "accessibility": float('nan')} for res in chain]
+            else:
+                try:
+                    from .accessibility_original import calculate_accessibility as _slow
+                    log.warning("Falling back to original 'loop' implementation for protein only.")
+                    return _slow(chain, n_dots=n_dots)
+                except ImportError:
+                    log.error("Original 'loop' backend implementation not found. Cannot proceed.")
+                    return [{**res, "accessibility": float('nan')} for res in chain]
 
         bar.update(task, completed=1)
 
-    # 3. Reduce atom → residue ---------------------------------------------
-    residue_sasa = jax.ops.segment_sum(atom_sasa, atom2res, len(chain))
-    residue_sasa_np = np.asarray(residue_sasa) # Convert to numpy for easier assignment
+    # 4. Aggregate SASA per entity (protein residue or ligand) ------------
+    # Use segment_sum with the combined atom_to_entity_idx mapping
+    entity_sasa = jax.ops.segment_sum(atom_sasa, atom_to_entity_idx_arr, num_entities)
+    entity_sasa_np = np.asarray(entity_sasa) # Convert to numpy
 
-    # Calculate and log total SASA
-    total_sasa = np.sum(residue_sasa_np)
-    log.info(f"--> Accessibility Calculation Complete. Total SASA: [b]{total_sasa:.2f}[/] Å²", extra={"markup": True})
+    # Calculate and log total SASA (protein + ligand)
+    total_sasa = np.sum(entity_sasa_np)
+    # Extract total protein SASA (summing only the residue parts)
+    total_protein_sasa = np.sum(entity_sasa_np[:len(chain)]) if len(chain) > 0 else 0.0
+    log.info(f"--> Accessibility Calculation Complete. Total Protein SASA: [b]{total_protein_sasa:.2f}[/] Å² ([b]{total_sasa:.2f}[/] Å² including ligands)", extra={"markup": True})
 
-    # 4. Attach back to chain ----------------------------------------------
+    # Log individual ligand SASA values if ligands were processed
+    if ligand_atoms:
+        for ligand_key, ligand_idx in ligand_key_map.items():
+            lig_sasa = entity_sasa_np[ligand_idx]
+            log.info(f"    SASA for Ligand {ligand_key}: [b]{lig_sasa:.2f}[/] Å²", extra={"markup": True})
+
+    # 5. Attach protein residue SASA back to protein chain -----------------
+    # We only return the protein ChainPytree, updated with its SASA values.
     return [
-        {**res, "accessibility": float(residue_sasa_np[i])} for i, res in enumerate(chain)
+        {**res, "accessibility": float(entity_sasa_np[i])} for i, res in enumerate(chain)
     ]
 
 

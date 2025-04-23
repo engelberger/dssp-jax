@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 import requests
 import shlex
 import collections
@@ -21,22 +21,30 @@ log = logging.getLogger("dsspjax")
 
 # --- CIF Parsing --- #
 
-def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict], List[List[Dict]]]:
+def load_cif_data(
+    cif_url_or_file: str,
+    model_num: int = 1,
+    target_ligand_keys: Optional[List[str]] = None
+) -> Tuple[List[Dict], List[List[Dict]], List[Dict]]:
     """Downloads (if URL) or reads (if local path) and parses a CIF file.
 
-    Focuses on the _atom_site loop and handles basic parsing complexities like
-    quoted fields and optional columns (insertion code, auth IDs).
+    Focuses on the _atom_site loop, parsing ATOM records and optionally
+    specific HETATM records for target ligands.
 
     Args:
         cif_url_or_file: URL or local file path to the mmCIF file.
         model_num: The PDB model number to extract (default is 1).
+        target_ligand_keys: Optional list of ligand identifiers in the format
+                            "ChainID:ResNum:CompID" (e.g., ["B:301:TPA"]).
+                            If provided, atoms matching these HETATM records
+                            will be extracted.
 
     Returns:
         A tuple containing:
-          - residue_info_list: List of dictionaries, each holding metadata for a residue
-            (res_name, seq_id, chain_id, pdb_ins_code, auth_asym_id, auth_seq_id).
-          - all_atom_data_list: List of lists. Each inner list contains dictionaries
-            for atoms in the corresponding residue (name, symbol, coords).
+          - residue_info_list: List of dictionaries for protein residues.
+          - all_atom_data_list: List of atom lists for protein residues.
+          - ligand_atoms_list: Flat list of dictionaries for atoms belonging
+                               to the target ligands.
 
     Raises:
         RuntimeError: If downloading the CIF file fails.
@@ -46,6 +54,8 @@ def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict],
         IOError: If reading a local file fails.
     """
     log.info(f"[bold cyan]Step 1: Loading Data[/] - Processing input: [i]{cif_url_or_file}[/] (Model {model_num})", extra={"markup": True})
+    if target_ligand_keys:
+        log.info(f"    Targeting HETATM ligands: {target_ligand_keys}")
     cif_text: str
     is_url = cif_url_or_file.lower().startswith(('http:', 'https:'))
 
@@ -105,7 +115,7 @@ def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict],
                 ]
                 optional_keys = [
                     "_atom_site.pdbx_PDB_ins_code", "_atom_site.auth_asym_id",
-                    "_atom_site.auth_seq_id"
+                    "_atom_site.auth_seq_id", "_atom_site.auth_comp_id"
                 ]
                 required_keys_check = required_keys_base
 
@@ -145,10 +155,13 @@ def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict],
         idx_ins_code = key_map.get("_atom_site.pdbx_PDB_ins_code")
         idx_auth_asym = key_map.get("_atom_site.auth_asym_id")
         idx_auth_seq = key_map.get("_atom_site.auth_seq_id")
+        idx_auth_comp = key_map.get("_atom_site.auth_comp_id")
     except KeyError as e:
         raise ValueError(f"Missing required key {e} in _atom_site loop.")
 
     residues_atoms_data = collections.OrderedDict() # Preserve insertion order
+    ligand_atoms_list = [] # New list for ligand atoms
+    parsed_target_ligand_keys = set(target_ligand_keys) if target_ligand_keys else set()
 
     # Process data lines
     for line_num, data_line_text in enumerate(atom_data_lines):
@@ -169,66 +182,104 @@ def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict],
                  log.warning(f"Skipping line {line_num+1} after fallback split due to column count mismatch. Parsed: {data_line}")
                  continue
 
-        # Filter for ATOM records and the specified model number
-        if data_line[idx_group] != 'ATOM': continue
+        # --- Process ATOM or HETATM --- #
+        record_type = data_line[idx_group]
+        if record_type not in ('ATOM', 'HETATM'): continue
+
+        # --- Filter by Model --- #
         try:
             current_model = int(data_line[idx_model])
             if current_model != model_num: continue
-            seq_id_str = data_line[idx_seq]
-            # Allow '.' for unknown sequence ID, treat as a special case
-            if seq_id_str == '.':
-                seq_id = -999 # Placeholder for unknown
-            elif not seq_id_str.lstrip('-').isdigit():
-                 log.warning(f"Skipping line {line_num+1} due to non-integer seq_id '{seq_id_str}'.")
-                 continue
-            else:
-                seq_id = int(seq_id_str)
         except (ValueError, IndexError):
-            log.warning(f"Skipping line {line_num+1} due to parsing error (model/seq_id). Line: '{data_line_text}'")
+            log.warning(f"Skipping line {line_num+1} due to model parsing error. Line: '{data_line_text}'")
             continue
 
-        # Get atom details
-        atom_name = data_line[idx_atom].strip('"') # Remove potential quotes
-        chain_id = data_line[idx_chain]
-        res_name = data_line[idx_res]
-        symbol = data_line[idx_symbol].strip('"').upper() # Ensure symbol is upper case
-        residue_key = (chain_id, seq_id)
+        # --- Extract Common Fields --- #
+        try:
+            atom_name = data_line[idx_atom].strip('"')
+            symbol = data_line[idx_symbol].strip('"').upper()
+            coords_np = np.array([float(data_line[idx_x]), float(data_line[idx_y]), float(data_line[idx_z])], dtype=np.float64)
+            # Get auth IDs safely, using label as fallback if necessary
+            auth_asym_id = data_line[idx_auth_asym] if idx_auth_asym is not None else data_line[idx_chain]
+            auth_seq_id_str = data_line[idx_auth_seq] if idx_auth_seq is not None else data_line[idx_seq]
+            # Prioritize auth_comp_id, fallback to label_comp_id (res_name)
+            auth_comp_id = data_line[idx_auth_comp] if idx_auth_comp is not None and data_line[idx_auth_comp] not in ('?', '.') else data_line[idx_res]
 
-        # Get optional fields safely, providing defaults
-        ins_code = data_line[idx_ins_code] if idx_ins_code is not None and data_line[idx_ins_code] not in ('?', '.') else ''
-        auth_asym_id = data_line[idx_auth_asym] if idx_auth_asym is not None else chain_id # Fallback
-        auth_seq_id = data_line[idx_auth_seq] if idx_auth_seq is not None else seq_id_str # Fallback
+        except (ValueError, IndexError) as e:
+            log.warning(f"Skipping line {line_num+1} due to basic field parsing error ({e}). Line: '{data_line_text}'")
+            continue
 
-        if residue_key not in residues_atoms_data:
-            residues_atoms_data[residue_key] = {
-                'res_name': res_name, 'chain_id': chain_id, 'seq_id': seq_id,
-                'pdb_ins_code': ins_code, 'auth_asym_id': auth_asym_id, 'auth_seq_id': auth_seq_id,
-                'atoms': []
-            }
-        elif residues_atoms_data[residue_key]['res_name'] != res_name:
-            # Check for consistency if residue key already exists (e.g., due to '.')
-            log.warning(f"Inconsistent residue name ('{res_name}' vs '{residues_atoms_data[residue_key]['res_name']}') for key {residue_key}. Keeping first encountered.")
-
-        # Store atom if name not already present (simple altLoc handling)
-        if not any(a['name'] == atom_name for a in residues_atoms_data[residue_key]['atoms']):
+        # --- Process ATOM Records (Protein Residues) --- #
+        if record_type == 'ATOM':
             try:
-                coords = np.array([float(data_line[idx_x]), float(data_line[idx_y]), float(data_line[idx_z])], dtype=np.float64)
-                residues_atoms_data[residue_key]['atoms'].append({'name': atom_name, 'symbol': symbol, 'coords': coords})
-            except (ValueError, IndexError):
-                log.warning(f"Skipping atom '{atom_name}' in residue {residue_key} due to coordinate parsing error. Line: '{data_line_text}'")
+                seq_id_str = data_line[idx_seq]
+                if seq_id_str == '.': seq_id = -999
+                elif not seq_id_str.lstrip('-').isdigit(): raise ValueError(f"non-integer seq_id '{seq_id_str}'")
+                else: seq_id = int(seq_id_str)
+            except (ValueError, IndexError) as e:
+                log.warning(f"Skipping ATOM line {line_num+1} due to seq_id parsing error ({e}). Line: '{data_line_text}'")
                 continue
 
-    # Convert OrderedDict to final lists, ensuring backbone completeness
-    residue_info_list, all_atom_data_list = [], []
-    required_backbone = {"N", "CA", "C"} # O is important but N, CA, C define geometry
+            chain_id = data_line[idx_chain]
+            res_name = data_line[idx_res]
+            ins_code = data_line[idx_ins_code] if idx_ins_code is not None and data_line[idx_ins_code] not in ('?', '.') else ''
+            residue_key = (chain_id, seq_id, ins_code) # Include ins_code in key
 
+            # Use auth IDs from extracted common fields
+            if residue_key not in residues_atoms_data:
+                residues_atoms_data[residue_key] = {
+                    'res_name': res_name, 'chain_id': chain_id, 'seq_id': seq_id,
+                    'pdb_ins_code': ins_code, 'auth_asym_id': auth_asym_id, 'auth_seq_id': auth_seq_id_str,
+                    'atoms': []
+                }
+            elif residues_atoms_data[residue_key]['res_name'] != res_name:
+                log.warning(f"Inconsistent residue name ('{res_name}' vs '{residues_atoms_data[residue_key]['res_name']}') for key {residue_key}. Keeping first encountered.")
+
+            # Store atom if name not already present (simple altLoc handling)
+            if not any(a['name'] == atom_name for a in residues_atoms_data[residue_key]['atoms']):
+                residues_atoms_data[residue_key]['atoms'].append({'name': atom_name, 'symbol': symbol, 'coords': coords_np})
+
+        # --- Process HETATM Records (Potential Ligands) --- #
+        elif record_type == 'HETATM' and parsed_target_ligand_keys:
+            # --- Debug: Print raw values ---
+            raw_auth_comp = data_line[idx_auth_comp] if idx_auth_comp is not None else "N/A"
+            raw_label_comp = data_line[idx_res]
+            #log.debug(f"    HETATM Raw: auth_comp='{raw_auth_comp}', label_comp='{raw_label_comp}'")
+            # --- End Debug ---
+
+            # Construct the key for matching: Chain:ResNum:CompID
+            # Use the already extracted auth_asym_id, auth_seq_id_str, auth_comp_id
+            # The 'auth_comp_id' variable here holds the result of the prioritized logic
+            #log.debug(f"    Chosen auth_comp_id for key: '{auth_comp_id}'") # Debug chosen value
+            ligand_key = f"{auth_asym_id}:{auth_seq_id_str}:{auth_comp_id}"
+            #log.debug(f"    Checking HETATM: Key='{ligand_key}'")
+
+            if ligand_key in parsed_target_ligand_keys:
+                log.debug(f"      MATCH FOUND! Adding atom '{atom_name}'")
+                # Store ligand atom info
+                ligand_atoms_list.append({
+                    'ligand_key': ligand_key,
+                    'name': atom_name,
+                    'symbol': symbol,
+                    'coords': coords_np
+                })
+                # Simple altLoc handling for ligands: keep first encountered atom name per ligand
+                # This might need refinement based on specific use cases
+                # We can filter duplicates later if needed
+
+    # --- Post-processing --- #
+    # Convert protein residue data to final lists
+    residue_info_list, all_atom_data_list = [], []
+    required_backbone = {"N", "CA", "C"}
     skipped_residue_count = 0
     for key, res_data in residues_atoms_data.items():
         present_atoms = {a['name'] for a in res_data['atoms']}
         if required_backbone.issubset(present_atoms):
+            # Reconstruct key components if needed (chain, seq, ins)
+            chain_id, seq_id, ins_code = key
             residue_info_list.append({
-                'res_name': res_data['res_name'], 'seq_id': res_data['seq_id'],
-                'chain_id': res_data['chain_id'], 'pdb_ins_code': res_data['pdb_ins_code'],
+                'res_name': res_data['res_name'], 'seq_id': seq_id, # Use parsed seq_id
+                'chain_id': chain_id, 'pdb_ins_code': ins_code,
                 'auth_asym_id': res_data['auth_asym_id'], 'auth_seq_id': res_data['auth_seq_id']
             })
             all_atom_data_list.append(res_data['atoms'])
@@ -238,9 +289,13 @@ def load_cif_data(cif_url_or_file: str, model_num: int = 1) -> Tuple[List[Dict],
             log.warning(f"Skipping residue {key} ({res_data['res_name']}) due to missing backbone atoms: {missing_bb}. Found: {present_atoms}")
 
     if skipped_residue_count > 0:
-        log.warning(f"--- Skipped {skipped_residue_count} residues due to missing backbone atoms ---")
-    log.info(f"--> Successfully parsed [b]{len(residue_info_list)}[/] residues with required backbone atoms from model {model_num}.", extra={"markup": True})
-    return residue_info_list, all_atom_data_list
+        log.warning(f"--- Skipped {skipped_residue_count} protein residues due to missing backbone atoms ---")
+
+    log.info(f"--> Successfully parsed [b]{len(residue_info_list)}[/] protein residues.", extra={"markup": True})
+    if ligand_atoms_list:
+        log.info(f"--> Extracted [b]{len(ligand_atoms_list)}[/] atoms for target ligands: {list(parsed_target_ligand_keys)}.", extra={"markup": True})
+
+    return residue_info_list, all_atom_data_list, ligand_atoms_list
 
 def create_pytree_structure(residue_info: List[Dict], all_atom_data: List[List[Dict]]) -> ChainPytree:
     """Converts loaded atom data into the JAX-friendly Pytree structure.

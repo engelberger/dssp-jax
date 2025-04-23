@@ -101,6 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("-cif", "--cif_out", help="Optional output file path for annotated mmCIF format.")
     parser.add_argument("--print_limit", type=int, default=50, help="Number of residues to print in summary (default: 50)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose DEBUG logging.")
+    parser.add_argument("--ligands", nargs='+', help="List of target ligand IDs (format: ChainID:ResNum:CompID) to include in SASA environment.", default=[])
 
     args = parser.parse_args()
 
@@ -112,7 +113,11 @@ if __name__ == "__main__":
     try:
         # Run the main DSSP pipeline
         log.info(f"Starting DSSP-JAX processing for: [bold]{args.cif_input}[/]", extra={"markup": True})
-        final_chain = run_dssp(args.cif_input, model_num=args.model)
+        final_chain = run_dssp(
+            args.cif_input,
+            model_num=args.model,
+            target_ligand_keys=args.ligands # Pass the list of target ligands
+        )
 
         # Print the summary table
         if final_chain:

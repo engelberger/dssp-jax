@@ -8,6 +8,7 @@
 import jax
 import jax.numpy as jnp
 import logging # Import logging
+from typing import Optional, List # Added Optional, List
 
 # Relative imports for different pipeline stages
 from .io import load_cif_data, create_pytree_structure
@@ -31,12 +32,19 @@ from .constants import kMinHBondEnergy, kMaxHBondEnergy # Import needed constant
 # Get the logger instance configured in __init__
 log = logging.getLogger("dsspjax")
 
-def run_dssp(cif_url_or_file: str, model_num: int = 1) -> ChainPytree:
+def run_dssp(
+    cif_url_or_file: str,
+    model_num: int = 1,
+    target_ligand_keys: Optional[List[str]] = None
+) -> ChainPytree:
     """Runs the full DSSP-JAX calculation pipeline on a given CIF input.
 
     Args:
         cif_url_or_file: Path or URL to the input mmCIF file.
         model_num: The model number to process from the CIF file.
+        target_ligand_keys: Optional list of ligand identifiers to include
+                            in the environment for SASA calculation
+                            (format: ["ChainID:ResNum:CompID"]).
 
     Returns:
         The final ChainPytree containing all calculated DSSP information.
@@ -55,10 +63,17 @@ def run_dssp(cif_url_or_file: str, model_num: int = 1) -> ChainPytree:
     # --- Pipeline Stages --- #
 
     # 1. Load Data (Handles download/local read internally now)
-    # TODO: Modify load_cif_data to handle both URLs and local paths
-    residue_info_list, all_atom_data_list = load_cif_data(cif_url_or_file, model_num)
-    if not residue_info_list:
-        raise ValueError("No valid residues with backbone atoms found in the input.")
+    # Load protein residues and optionally specified ligand atoms
+    residue_info_list, all_atom_data_list, ligand_atoms_list = load_cif_data(
+        cif_url_or_file, model_num, target_ligand_keys=target_ligand_keys
+    )
+    # Check if protein residues were found
+    if not residue_info_list and not ligand_atoms_list:
+        raise ValueError("No valid protein residues or target ligand atoms found in the input.")
+    # Allow processing if only ligands were requested/found, although ChainPytree will be empty.
+    elif not residue_info_list:
+        log.warning("No valid protein residues found, processing may be limited.")
+        # Handle case where only ligand SASA might be relevant (future step)
 
     # 2. Create Initial Pytree Structure
     protein_chain = create_pytree_structure(residue_info_list, all_atom_data_list)
@@ -128,8 +143,11 @@ def run_dssp(cif_url_or_file: str, model_num: int = 1) -> ChainPytree:
     log.info("--> Refined helix start/middle/end flags.")
 
     # 10. Calculate Accessibility (SASA)
-    # Takes the Pytree with final SS assignments and coords.
-    protein_chain_final = calculate_accessibility(protein_chain_refined)
+    # Pass the processed protein chain and the extracted ligand atoms
+    protein_chain_final = calculate_accessibility(
+        protein_chain_refined, # Contains protein atoms
+        ligand_atoms=ligand_atoms_list # Pass ligand atoms separately
+    )
     # Accessibility calculation prints its own completion message.
 
     log.info("\n[bold green]:heavy_check_mark: DSSP-JAX Pipeline Complete[/]", extra={"markup": True})

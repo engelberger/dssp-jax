@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsspjax"
+version = "0.1.0"
+authors = [
+  { name="Felipe Engelberger", email="felipeengelberger@gmail.com" }, # TODO: Replace with actual author info
+]
+description = "A JAX-based implementation of the DSSP algorithm."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # TODO: Choose your license
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "jax[cpu]", # Or jax[cuda] or jax[tpu] depending on backend
+    "numpy>=1.21",
+    "requests",
+    "gemmi", # Optional, but needed for the current mmCIF output logic
+    "rich", # Added for enhanced console output
+    # Add other dependencies as needed, e.g., for CLI: "typer"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/engelberger/dssp-jax" # TODO: Replace with actual URL
+"Bug Tracker" = "https://github.com/engelberger/dssp-jax/issues" # TODO: Replace 
